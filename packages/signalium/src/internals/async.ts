@@ -18,6 +18,8 @@ import { createStateSignal } from './state.js';
 import { useStateSignal } from '../config.js';
 import { isGeneratorResult, isPromise } from './utils/type-utils.js';
 import { DEFAULT_EQUALS, equalsFrom, FALSE_EQUALS } from './utils/equals.js';
+import { Context, Span, context as otelContext, trace } from '@opentelemetry/api';
+import { tracer } from '../otel.js';
 
 const enum AsyncFlags {
   // ======= Notifiers ========
@@ -71,6 +73,9 @@ export class ReactivePromise<T, Args extends unknown[] = unknown[]> implements B
   private _version = createStateSignal(0);
   private _boundRun: ((...args: Args) => ReactivePromise<T, Args>) | undefined;
 
+  private _otelContext?: Context;
+  private _otelSpan?: Span;
+
   static createPromise<T>(promise: Promise<T>, signal?: DerivedSignal<T, unknown[]>, initValue?: T | undefined) {
     const p = new ReactivePromise<T>();
 
@@ -78,6 +83,10 @@ export class ReactivePromise<T, Args extends unknown[] = unknown[]> implements B
     p._equals = signal?.def.equals ?? DEFAULT_EQUALS;
 
     p._initFlags(AsyncFlags.Pending, initValue);
+
+    // Capture the current OpenTelemetry context and span when the promise is created
+    p._otelContext = otelContext.active();
+    p._otelSpan = trace.getSpan(p._otelContext);
 
     if (promise) {
       p._setPromise(promise);
@@ -264,9 +273,6 @@ export class ReactivePromise<T, Args extends unknown[] = unknown[]> implements B
   }
 
   async _setPromise(promise: Promise<T>) {
-    // Store the current promise so we can check if it's the same promise in the
-    // then handlers. If it's not the same promise, it means that the promise has
-    // been recomputed and replaced, so we should not update state.
     this._promise = promise;
 
     const flags = this._flags;
@@ -281,7 +287,18 @@ export class ReactivePromise<T, Args extends unknown[] = unknown[]> implements B
     }
 
     try {
-      const nextValue = await promise;
+      // Run the promise in the captured context
+      const nextValue = await otelContext.with(this._otelContext ?? otelContext.active(), async () => {
+        if (this._otelSpan) {
+          console.log('ReactivePromise._setPromise: adding event "ReactivePromise resolving"', this._otelSpan);
+          this._otelSpan.addEvent('ReactivePromise resolving');
+        }
+        const result = await promise;
+        if (this._otelSpan) {
+          this._otelSpan.addEvent('ReactivePromise resolved');
+        }
+        return result;
+      });
 
       if (promise !== this._promise) {
         return;
@@ -292,8 +309,15 @@ export class ReactivePromise<T, Args extends unknown[] = unknown[]> implements B
       if (promise !== this._promise) {
         return;
       }
-
+      if (this._otelSpan) {
+        this._otelSpan.addEvent('ReactivePromise rejected');
+        this._otelSpan.recordException(nextError instanceof Error ? nextError : { message: String(nextError) });
+      }
       this._setError(nextError, awaitSubs);
+    } finally {
+      if (this._otelSpan) {
+        this._otelSpan.end();
+      }
     }
   }
 

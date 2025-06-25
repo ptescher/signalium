@@ -6,6 +6,7 @@ import { watchSignal } from './connect.js';
 import { ReactivePromise } from './async.js';
 import { ReactiveValue } from '../types.js';
 import { isGeneratorResult, isPromise, isReactivePromise } from './utils/type-utils.js';
+import { context as otelContext } from '@opentelemetry/api';
 
 export let CURRENT_CONSUMER: DerivedSignal<any, any> | undefined;
 
@@ -128,7 +129,11 @@ export function runSignal(signal: DerivedSignal<any, any[]>) {
 
     const initialized = updatedCount !== 0;
     const prevValue = signal.value;
-    let nextValue = signal.def.compute(...signal.args);
+
+    // Execute the compute function within the active OpenTelemetry context
+    let nextValue = otelContext.with(otelContext.active(), () => {
+      return signal.def.compute(...signal.args);
+    });
     let valueIsPromise = false;
 
     if (nextValue !== null && typeof nextValue === 'object') {
@@ -252,6 +257,9 @@ export function generatorResultToPromise<T, Args extends unknown[]>(
   generator: Generator<any, T>,
   savedConsumer: DerivedSignal<any, any> | undefined,
 ): Promise<T> {
+  // Capture the current OpenTelemetry context
+  const savedOtelContext = otelContext.active();
+
   function adopt(value: any) {
     return typeof value === 'object' && value !== null && (isPromise(value) || isReactivePromise(value))
       ? value
@@ -272,7 +280,10 @@ export function generatorResultToPromise<T, Args extends unknown[]>(
 
       try {
         CURRENT_CONSUMER = savedConsumer;
-        step(generator.next(value));
+        // Execute generator.next within the saved OpenTelemetry context
+        otelContext.with(savedOtelContext, () => {
+          step(generator.next(value));
+        });
       } catch (e) {
         reject(e);
       } finally {
@@ -285,7 +296,10 @@ export function generatorResultToPromise<T, Args extends unknown[]>(
 
       try {
         CURRENT_CONSUMER = savedConsumer;
-        step(generator['throw'](value));
+        // Execute generator.throw within the saved OpenTelemetry context
+        otelContext.with(savedOtelContext, () => {
+          step(generator['throw'](value));
+        });
       } catch (e) {
         reject(e);
       } finally {
@@ -293,6 +307,9 @@ export function generatorResultToPromise<T, Args extends unknown[]>(
       }
     }
 
-    step(generator.next());
+    // Execute the initial generator.next within the saved OpenTelemetry context
+    otelContext.with(savedOtelContext, () => {
+      step(generator.next());
+    });
   });
 }
